@@ -635,17 +635,32 @@ static inline void chg_init_state(struct chg_drv *chg_drv)
  * called from google_charger direcly on a tcpm_psy.
  * NOTE: Do not call on anything else!
  */
+/*
+ * Slow charging: when set, only the 5V fixed PDO (2A) is advertised to the
+ * source, whatever the rest of the driver asks for. See usb_5v_only.
+ */
+#define PD_SNK_SLOW_MA			2000
+#define USB_ICL_SLOW_UA			2000000
+#define SLOW_CHG_VOTER			"SLOW_CHG_VOTER"
+static bool chg_usb_5v_only;
+/* one renegotiation per connection from chg_work, reset on disconnect */
+static bool chg_usb_5v_renegotiated;
+
 static int chg_update_capability(struct power_supply *tcpm_psy, unsigned int nr_pdo,
 				 u32 pps_cap)
 {
 	struct tcpm_port *port;
-	const u32 pdo[] = {PDO_FIXED(5000, PD_SNK_MAX_MA, PDO_FIXED_FLAGS),
+	const u32 pdo[] = {PDO_FIXED(5000, READ_ONCE(chg_usb_5v_only) ?
+				     PD_SNK_SLOW_MA : PD_SNK_MAX_MA, PDO_FIXED_FLAGS),
 			   PDO_FIXED(PD_SNK_MAX_MV, PD_SNK_MAX_MA_9V, 0),
 			   pps_cap};
 	int ret = -ENODEV;
 
 	if (!tcpm_psy || !nr_pdo || nr_pdo > PDO_MAX_SUPP)
 		return -EINVAL;
+
+	if (READ_ONCE(chg_usb_5v_only))
+		nr_pdo = PDO_FIXED_5V;
 
 	port = chg_get_tcpm_port(tcpm_psy);
 	if (port)
@@ -674,6 +689,8 @@ static inline int chg_reset_state(struct chg_drv *chg_drv)
 
 	if (chg_drv->chg_term.usb_5v == 1)
 		chg_drv->chg_term.usb_5v = 0;
+
+	chg_usb_5v_renegotiated = false;
 
 	/* TODO: handle interaction with PPS code */
 	gvotable_cast_int_vote(chg_drv->msc_interval_votable,
@@ -3033,6 +3050,14 @@ update_charger:
 	if (chg_done)
 		pr_debug("MSC_CHG charge full force 5V: %d\n", force_5v);
 
+	/* slow charging: renegotiate if the source still runs above 5V */
+	if (READ_ONCE(chg_usb_5v_only) && !chg_usb_5v_renegotiated &&
+	    usb_pd_is_high_volt(&ad)) {
+		pr_info("MSC_CHG usb_5v_only: renegotiate 5V\n");
+		chg_update_capability(chg_drv->tcpm_psy, PDO_FIXED_5V, 0);
+		chg_usb_5v_renegotiated = true;
+	}
+
 	/* tied to the charger: could tie to battery @ 100% instead */
 	if (!chg_drv->chg_term.usb_5v && chg_done && usb_pd_is_high_volt(&ad) && force_5v) {
 		pr_info("MSC_CHG switch to 5V on full\n");
@@ -3231,6 +3256,61 @@ static ssize_t set_charge_stop_level(struct device *dev,
 
 static DEVICE_ATTR(charge_stop_level, 0660, show_charge_stop_level,
 					    set_charge_stop_level);
+
+static ssize_t usb_5v_only_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "%d\n", READ_ONCE(chg_usb_5v_only));
+}
+
+static ssize_t usb_5v_only_store(struct device *dev, struct device_attribute *attr,
+				 const char *buf, size_t count)
+{
+	struct chg_drv *chg_drv = dev_get_drvdata(dev);
+	struct gvotable_election *el;
+	bool enable;
+	int ret;
+
+	ret = kstrtobool(buf, &enable);
+	if (ret < 0)
+		return ret;
+
+	if (enable == READ_ONCE(chg_usb_5v_only))
+		return count;
+
+	WRITE_ONCE(chg_usb_5v_only, enable);
+	pr_info("MSC_CHG usb_5v_only=%d\n", enable);
+
+	/* no PPS direct charging (it would advertise APDOs again) */
+	el = gvotable_election_get_handle(VOTABLE_DC_CHG_AVAIL);
+	if (el)
+		gvotable_cast_int_vote(el, SLOW_CHG_VOTER, 0, enable);
+	else
+		pr_warn("MSC_CHG usb_5v_only: no %s election\n", VOTABLE_DC_CHG_AVAIL);
+
+	/* input current limit, also for non-PD (Type-C 3A, BC1.2) sources */
+	el = gvotable_election_get_handle("USB_ICL");
+	if (el)
+		gvotable_cast_int_vote(el, SLOW_CHG_VOTER, USB_ICL_SLOW_UA, enable);
+	else
+		pr_warn("MSC_CHG usb_5v_only: no USB_ICL election\n");
+
+	if (enable) {
+		chg_update_capability(chg_drv->tcpm_psy, PDO_FIXED_5V, 0);
+	} else {
+		unsigned int nr_pdo = chg_drv->pps_data.default_pps_pdo ?
+				      PDO_PPS : PDO_FIXED_HIGH_VOLTAGE;
+
+		chg_update_capability(chg_drv->tcpm_psy, nr_pdo,
+				      chg_drv->pps_data.default_pps_pdo);
+	}
+
+	if (chg_drv->bat_psy)
+		power_supply_changed(chg_drv->bat_psy);
+
+	return count;
+}
+
+static DEVICE_ATTR_RW(usb_5v_only);
 
 static ssize_t
 show_charge_start_level(struct device *dev,
@@ -4427,6 +4507,12 @@ static int chg_init_fs(struct chg_drv *chg_drv)
 	ret = device_create_file(chg_drv->device, &dev_attr_charge_stop_level);
 	if (ret != 0) {
 		pr_err("Failed to create charge_stop_level files, ret=%d\n", ret);
+		return ret;
+	}
+
+	ret = device_create_file(chg_drv->device, &dev_attr_usb_5v_only);
+	if (ret != 0) {
+		pr_err("Failed to create usb_5v_only files, ret=%d\n", ret);
 		return ret;
 	}
 
